@@ -15,6 +15,7 @@ requires-python = ">=3.10"
 dependencies = [
     "fastmcp>=2.0.0",
     "google-analytics-data>=0.16.0",
+    "google-auth-oauthlib>=1.2.0",
 ]
 keywords = ["google-analytics", "mcp", "ai-assistant", "analytics", "ga4", "claude", "cursor", "windsurf"]
 classifiers = [

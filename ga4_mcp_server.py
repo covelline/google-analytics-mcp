@@ -3,33 +3,114 @@ from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
     DateRange, Dimension, Metric, RunReportRequest, Filter, FilterExpression, FilterExpressionList
 )
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 import os
 import sys
 import json
+import argparse
+import webbrowser
+import pickle
+from pathlib import Path
+import logging
+import threading
+import socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Configuration from environment variables
-CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-GA4_PROPERTY_ID = os.getenv("GA4_PROPERTY_ID")
+# OAuth2 configuration
+SCOPES = ['https://www.googleapis.com/auth/analytics.readonly']
 
-# Validate required environment variables
-if not CREDENTIALS_PATH:
-    print("ERROR: GOOGLE_APPLICATION_CREDENTIALS environment variable not set", file=sys.stderr)
-    print("Please set it to the path of your service account JSON file", file=sys.stderr)
-    sys.exit(1)
+# Global variables for configuration
+GA4_PROPERTY_ID = None
+CREDENTIALS = None
+TOKEN_PATH = 'token.pickle'
+CLIENT_SECRETS = {
+    "installed": {
+        "client_id": "your-client-id.apps.googleusercontent.com",
+        "client_secret": "your-client-secret",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "redirect_uris": ["http://localhost:8080"]
+    }
+}
 
-if not GA4_PROPERTY_ID:
-    print("ERROR: GA4_PROPERTY_ID environment variable not set", file=sys.stderr)
-    print("Please set it to your GA4 property ID (e.g., 123456789)", file=sys.stderr)
-    sys.exit(1)
-
-# Validate credentials file exists
-if not os.path.exists(CREDENTIALS_PATH):
-    print(f"ERROR: Credentials file not found: {CREDENTIALS_PATH}", file=sys.stderr)
-    print("Please check the GOOGLE_APPLICATION_CREDENTIALS path", file=sys.stderr)
-    sys.exit(1)
+# Configuration class to hold runtime settings
+class Config:
+    def __init__(self):
+        self.property_id = None
+        self.token_path = 'token.pickle'
+        self.port = 8000
+        self.host = 'localhost'
+        self.client_id = None
+        self.client_secret = None
+        self.setup_mode = False
+        
+config = Config()
 
 # Initialize FastMCP
 mcp = FastMCP("Google Analytics 4")
+
+# OAuth2 authentication functions
+def get_oauth_credentials():
+    """Get OAuth2 credentials, handling the full flow if needed."""
+    creds = None
+    
+    # Check if token.pickle file exists
+    if os.path.exists(config.token_path):
+        with open(config.token_path, 'rb') as token:
+            creds = pickle.load(token)
+    
+    # If there are no (valid) credentials available, let the user log in
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                print("Refreshing expired OAuth token...", file=sys.stderr)
+                creds.refresh(Request())
+            except Exception as e:
+                print(f"Token refresh failed: {e}", file=sys.stderr)
+                creds = None
+        
+        if not creds:
+            if not config.client_id or not config.client_secret:
+                print("\n" + "="*60, file=sys.stderr)
+                print("OAUTH2 SETUP REQUIRED", file=sys.stderr)
+                print("="*60, file=sys.stderr)
+                print("\nTo use this GA4 MCP server, you need to set up OAuth2 credentials.", file=sys.stderr)
+                print("\n1. Go to Google Cloud Console:", file=sys.stderr)
+                print("   https://console.cloud.google.com/apis/credentials", file=sys.stderr)
+                print("\n2. Create OAuth2 credentials for a 'Desktop Application'", file=sys.stderr)
+                print("\n3. Download the JSON file and extract:", file=sys.stderr)
+                print("   - client_id", file=sys.stderr)
+                print("   - client_secret", file=sys.stderr)
+                print("\n4. Set these as environment variables:", file=sys.stderr)
+                print("   export GOOGLE_OAUTH_CLIENT_ID='your-client-id'", file=sys.stderr)
+                print("   export GOOGLE_OAUTH_CLIENT_SECRET='your-client-secret'", file=sys.stderr)
+                print("\n5. Restart the server", file=sys.stderr)
+                print("="*60, file=sys.stderr)
+                sys.exit(1)
+            
+            # Update CLIENT_SECRETS with provided credentials
+            CLIENT_SECRETS['installed']['client_id'] = config.client_id
+            CLIENT_SECRETS['installed']['client_secret'] = config.client_secret
+            
+            print("\nStarting OAuth2 authentication flow...", file=sys.stderr)
+            print("A browser window will open for you to authorize this application.", file=sys.stderr)
+            
+            flow = InstalledAppFlow.from_client_config(CLIENT_SECRETS, SCOPES)
+            creds = flow.run_local_server(port=8080)
+            
+        # Save the credentials for the next run
+        with open(config.token_path, 'wb') as token:
+            pickle.dump(creds, token)
+            print(f"OAuth2 credentials saved to {config.token_path}", file=sys.stderr)
+    
+    return creds
+
+def get_authenticated_client():
+    """Get an authenticated GA4 client using OAuth2."""
+    credentials = get_oauth_credentials()
+    return BetaAnalyticsDataClient(credentials=credentials)
 
 # Embedded GA4 Dimensions Data
 GA4_DIMENSIONS = {
@@ -563,12 +644,12 @@ def get_ga4_data(
             if filter_expression is None:
                 return {"error": "Invalid or unsupported dimension_filter structure, or invalid dimension name."}
 
-        # GA4 API Call
-        client = BetaAnalyticsDataClient()
+        # GA4 API Call with OAuth2
+        client = get_authenticated_client()
         dimension_objects = [Dimension(name=d) for d in parsed_dimensions]
         metric_objects = [Metric(name=m) for m in parsed_metrics]
         request = RunReportRequest(
-            property=f"properties/{GA4_PROPERTY_ID}",
+            property=f"properties/{config.property_id}",
             dimensions=dimension_objects,
             metrics=metric_objects,
             date_ranges=[DateRange(start_date=date_range_start, end_date=date_range_end)],
@@ -597,10 +678,96 @@ def get_ga4_data(
             error_message += f" Details: {e.details()}"
         return {"error": error_message}
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='Google Analytics 4 MCP Server with OAuth2 and SSE support')
+    parser.add_argument('--property-id', 
+                       help='GA4 Property ID (can also be set via GA4_PROPERTY_ID env var)')
+    parser.add_argument('--token-path', default='token.pickle',
+                       help='Path to store OAuth2 token (default: token.pickle)')
+    parser.add_argument('--port', type=int, default=8000,
+                       help='Port for SSE server (default: 8000)')
+    parser.add_argument('--host', default='localhost',
+                       help='Host for SSE server (default: localhost)')
+    parser.add_argument('--client-id',
+                       help='Google OAuth2 Client ID (can also be set via GOOGLE_OAUTH_CLIENT_ID env var)')
+    parser.add_argument('--client-secret',
+                       help='Google OAuth2 Client Secret (can also be set via GOOGLE_OAUTH_CLIENT_SECRET env var)')
+    parser.add_argument('--setup', action='store_true',
+                       help='Run initial OAuth2 setup')
+    parser.add_argument('--transport', choices=['stdio', 'sse'], default='sse',
+                       help='Transport mode: stdio or sse (default: sse)')
+    return parser.parse_args()
+
+def validate_configuration():
+    """Validate that all required configuration is present."""
+    # Check for property ID
+    if not config.property_id:
+        config.property_id = os.getenv('GA4_PROPERTY_ID')
+    
+    if not config.property_id:
+        print("ERROR: GA4 Property ID not specified", file=sys.stderr)
+        print("Please provide it via --property-id or set GA4_PROPERTY_ID environment variable", file=sys.stderr)
+        return False
+    
+    # Check for OAuth credentials
+    if not config.client_id:
+        config.client_id = os.getenv('GOOGLE_OAUTH_CLIENT_ID')
+    
+    if not config.client_secret:
+        config.client_secret = os.getenv('GOOGLE_OAUTH_CLIENT_SECRET')
+    
+    return True
+
 def main():
     """Main entry point for the MCP server"""
-    print("Starting GA4 MCP server...", file=sys.stderr)
-    mcp.run(transport="stdio")
+    args = parse_args()
+    
+    # Configure from args and environment
+    config.property_id = args.property_id
+    config.token_path = args.token_path
+    config.port = args.port
+    config.host = args.host
+    config.client_id = args.client_id
+    config.client_secret = args.client_secret
+    config.setup_mode = args.setup
+    
+    # Validate configuration
+    if not validate_configuration():
+        sys.exit(1)
+    
+    if config.setup_mode:
+        print("Running OAuth2 setup...", file=sys.stderr)
+        try:
+            get_oauth_credentials()
+            print("OAuth2 setup completed successfully!", file=sys.stderr)
+            print(f"Token saved to: {config.token_path}", file=sys.stderr)
+            print("\nYou can now start the server without --setup flag.", file=sys.stderr)
+        except Exception as e:
+            print(f"OAuth2 setup failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+    
+    print(f"Starting GA4 MCP server on {config.host}:{config.port}...", file=sys.stderr)
+    print(f"Using GA4 Property ID: {config.property_id}", file=sys.stderr)
+    print(f"Transport mode: {args.transport}", file=sys.stderr)
+    
+    try:
+        # Test OAuth credentials on startup
+        get_oauth_credentials()
+        print("OAuth2 authentication successful", file=sys.stderr)
+        
+        # Start the server
+        if args.transport == 'sse':
+            mcp.run(transport="sse", host=config.host, port=config.port)
+        else:
+            mcp.run(transport="stdio")
+            
+    except KeyboardInterrupt:
+        print("\nServer stopped by user", file=sys.stderr)
+    except Exception as e:
+        print(f"Server error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 # Start the server when run directly
 if __name__ == "__main__":
