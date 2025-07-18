@@ -1,3 +1,4 @@
 fastmcp>=2.0.0
 google-analytics-data>=0.16.0
 google-auth-oauthlib>=1.2.0
+google-analytics-admin>=0.24.1

@@ -3,6 +3,10 @@ from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
     DateRange, Dimension, Metric, RunReportRequest, Filter, FilterExpression, FilterExpressionList
 )
+from google.analytics.admin_v1beta import AnalyticsAdminServiceClient
+from google.analytics.admin_v1beta.types import (
+    ListAccountSummariesRequest
+)
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -19,7 +23,9 @@ import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # OAuth2 configuration
-SCOPES = ['https://www.googleapis.com/auth/analytics.readonly']
+SCOPES = [
+    'https://www.googleapis.com/auth/analytics.readonly',  # For Analytics Data API
+]
 
 # Global variables for configuration
 GA4_PROPERTY_ID = None
@@ -35,10 +41,151 @@ CLIENT_SECRETS = {
     }
 }
 
+# Property management module
+property_manager = None
+
+# GA4 Property Manager class
+class GA4PropertyManager:
+    """Manages GA4 properties using the Google Analytics Admin API."""
+    
+    def __init__(self, credentials):
+        """Initialize the property manager with OAuth2 credentials.
+        
+        Args:
+            credentials: OAuth2 credentials for Google Analytics APIs.
+        """
+        self.credentials = credentials
+        self.properties = {}  # Property ID to property info mapping (cache)
+        self.admin_client = None
+        self.initialize_client()
+    
+    def initialize_client(self):
+        """Initialize the Analytics Admin API client."""
+        
+        try:
+            self.admin_client = AnalyticsAdminServiceClient(credentials=self.credentials)
+            print("Analytics Admin API client initialized successfully", file=sys.stderr)
+        except Exception as e:
+            print(f"Failed to initialize Analytics Admin API client: {e}", file=sys.stderr)
+            self.admin_client = None
+    
+    def list_properties(self):
+        """List all available GA4 properties the user has access to.
+        
+        Returns:
+            List of dictionaries containing property information, or an error dictionary.
+        """
+        if not self.admin_client:
+            return {"error": "Google Analytics Admin API client not available."
+                    + " Install google-analytics-admin package and ensure proper credentials."}
+        
+        try:
+            properties = []
+            next_page_token = ""
+            while True:
+                # accountSummariesリクエストを送信
+                request = ListAccountSummariesRequest(page_size=200, page_token=next_page_token)
+                response = self.admin_client.list_account_summaries(request=request)
+                
+                # 各アカウントサマリーを処理
+                for account_summary in response.account_summaries:
+                    # 各アカウントに含まれるプロパティサマリーを処理
+                    for property_summary in account_summary.property_summaries:
+                        # プロパティIDを抽出（形式: properties/{property_id}）
+                        prop_id = property_summary.property.split('/')[-1]
+                        
+                        # プロパティ情報辞書を作成
+                        prop_info = {
+                            "id": prop_id,
+                            "display_name": property_summary.display_name,
+                            # PropertySummaryにはcreate_timeとupdate_timeがないため、Noneを設定
+                            "create_time": None,
+                            "update_time": None,
+                            "parent": account_summary.account,  # 親アカウント情報を設定
+                            "account_name": account_summary.display_name  # アカウント名も追加
+                        }
+                        
+                        # 結果に追加しキャッシュを更新
+                        properties.append(prop_info)
+                        self.properties[prop_id] = prop_info
+                
+                # 次のページがあるかチェック
+                next_page_token = response.next_page_token
+                if not next_page_token:
+                    break
+            
+            return properties
+        except Exception as e:
+            error_message = f"Failed to list GA4 properties: {str(e)}"
+            print(error_message, file=sys.stderr)
+            return {"error": error_message}
+    
+    def get_property_info(self, property_id):
+        """Get detailed information about a specific GA4 property.
+        
+        Args:
+            property_id: The ID of the GA4 property.
+            
+        Returns:
+            Dictionary containing property information, or an error dictionary.
+        """
+        # Check cache first
+        if property_id in self.properties:
+            return self.properties[property_id]
+        
+        # Not in cache, fetch from API
+        if not self.admin_client:
+            return {"error": "Google Analytics Admin API client not available."}
+        
+        try:
+            property = self.admin_client.get_property(name=f"properties/{property_id}")
+            
+            # Extract property ID from the full resource name
+            prop_id = property.name.split('/')[-1]
+            
+            # Create property info dictionary
+            prop_info = {
+                "id": prop_id,
+                "display_name": property.display_name,
+                "create_time": property.create_time.isoformat() if property.create_time else None,
+                "update_time": property.update_time.isoformat() if property.update_time else None,
+                "parent": property.parent
+            }
+            
+            # Update cache and return
+            self.properties[prop_id] = prop_info
+            return prop_info
+        except Exception as e:
+            error_message = f"Failed to get GA4 property info: {str(e)}"
+            print(error_message, file=sys.stderr)
+            return {"error": error_message}
+    
+    def validate_property_id(self, property_id):
+        """Validate that a property ID exists and is accessible.
+        
+        Args:
+            property_id: The ID of the GA4 property to validate.
+            
+        Returns:
+            Boolean indicating whether the property ID is valid.
+        """
+        # Check cache first
+        if property_id in self.properties:
+            return True
+        
+        # Not in cache, try to fetch property info
+        try:
+            property_info = self.get_property_info(property_id)
+            return "error" not in property_info
+        except Exception:
+            # If an exception occurs, property ID is invalid
+            return False
+
 # Configuration class to hold runtime settings
 class Config:
     def __init__(self):
-        self.property_id = None
+        # property_id is now optional - if not provided, must specify in API calls
+        self.property_id = None  
         self.token_path = 'token.pickle'
         self.port = 8000
         self.host = 'localhost'
@@ -96,6 +243,7 @@ def get_oauth_credentials():
             
             print("\nStarting OAuth2 authentication flow...", file=sys.stderr)
             print("A browser window will open for you to authorize this application.", file=sys.stderr)
+            print("Note: We're requesting additional permissions to access GA4 property information.", file=sys.stderr)
             
             flow = InstalledAppFlow.from_client_config(CLIENT_SECRETS, SCOPES)
             creds = flow.run_local_server(port=8080)
@@ -105,7 +253,34 @@ def get_oauth_credentials():
             pickle.dump(creds, token)
             print(f"OAuth2 credentials saved to {config.token_path}", file=sys.stderr)
     
+    # Initialize the property manager with the credentials
+    initialize_property_manager(creds)
+    
     return creds
+
+def initialize_property_manager(credentials):
+    """Initialize the GA4 Property Manager with OAuth2 credentials.
+    
+    Args:
+        credentials: OAuth2 credentials for Google Analytics APIs.
+    """
+    global property_manager
+    
+    try:
+        property_manager = GA4PropertyManager(credentials)
+        print("GA4 Property Manager initialized", file=sys.stderr)
+        
+        # If a default property ID is provided, verify it exists
+        if config.property_id and property_manager:
+            valid = property_manager.validate_property_id(config.property_id)
+            if valid:
+                print(f"Verified default property ID: {config.property_id}", file=sys.stderr)
+            else:
+                print(f"Warning: Default property ID {config.property_id} may not be valid or accessible", file=sys.stderr)
+                print("Use list_ga4_properties tool to see available properties", file=sys.stderr)
+    except Exception as e:
+        print(f"Failed to initialize Property Manager: {e}", file=sys.stderr)
+        property_manager = None
 
 def get_authenticated_client():
     """Get an authenticated GA4 client using OAuth2."""
@@ -421,6 +596,29 @@ def load_metrics():
     return GA4_METRICS
 
 @mcp.tool()
+def list_ga4_properties():
+    """
+    List all available GA4 properties the user has access to.
+    
+    Use this tool to discover all GA4 properties available to you.
+    The returned list includes property IDs which are required for data access.
+    
+    Returns:
+        List of dictionaries containing property information:
+        - id: The GA4 property ID (required for data access)
+        - display_name: The display name of the property
+        - create_time: When the property was created
+        - update_time: When the property was last updated
+        - parent: The parent account information
+    """
+    global property_manager
+    
+    if not property_manager:
+        return {"error": "Property manager not initialized. Authentication may have failed."}
+    
+    return property_manager.list_properties()
+
+@mcp.tool()
 def list_dimension_categories():
     """
     List all available GA4 dimension categories with descriptions.
@@ -473,6 +671,31 @@ def get_dimensions_by_category(category):
         return {"error": f"Category '{category}' not found. Available categories: {available_categories}"}
 
 @mcp.tool()
+def get_ga4_property_info(property_id):
+    """
+    Get detailed information about a specific GA4 property.
+    
+    Use this tool to get information about a specific property when you know its ID.
+    
+    Args:
+        property_id: The ID of the GA4 property to retrieve information for
+        
+    Returns:
+        Dictionary containing property information:
+        - id: The GA4 property ID
+        - display_name: The display name of the property
+        - create_time: When the property was created
+        - update_time: When the property was last updated
+        - parent: The parent account information
+    """
+    global property_manager
+    
+    if not property_manager:
+        return {"error": "Property manager not initialized. Authentication may have failed."}
+    
+    return property_manager.get_property_info(property_id)
+
+@mcp.tool()
 def get_metrics_by_category(category):
     """
     Get all metrics in a specific category with their descriptions.
@@ -492,6 +715,7 @@ def get_metrics_by_category(category):
 
 @mcp.tool()
 def get_ga4_data(
+    property_id,
     dimensions=["date"],
     metrics=["totalUsers", "newUsers", "bounceRate", "screenPageViewsPerSession", "averageSessionDuration"],
     date_range_start="7daysAgo",
@@ -502,6 +726,8 @@ def get_ga4_data(
     Retrieve GA4 metrics data broken down by the specified dimensions.
     
     Args:
+        property_id: The GA4 property ID to query data from (required).
+                     Use list_ga4_properties to get available property IDs.
         dimensions: List of GA4 dimensions (e.g., ["date", "city"]) or a string 
                     representation (e.g., "[\"date\", \"city\"]" or "date,city").
         metrics: List of GA4 metrics (e.g., ["totalUsers", "newUsers"]) or a string
@@ -514,6 +740,23 @@ def get_ga4_data(
         List of dictionaries containing the requested data, or an error dictionary.
     """
     try:
+        # Validate that property_id is provided and valid
+        if not property_id:
+            return {"error": "property_id is required. Use list_ga4_properties tool to get available property IDs."}
+        
+        # Validate the property ID if property manager is available
+        global property_manager
+        if property_manager:
+            valid_property = property_manager.validate_property_id(property_id)
+            if not valid_property:
+                # Try to get a list of available properties to help the user
+                properties = property_manager.list_properties()
+                if isinstance(properties, list) and properties:
+                    available_ids = [p["id"] for p in properties]
+                    return {"error": f"Invalid property ID: {property_id}. Available property IDs: {available_ids}"}
+                else:
+                    return {"error": f"Invalid property ID: {property_id}. Use list_ga4_properties tool to get available property IDs."}
+        
         # Handle cases where dimensions might be passed as a string from the MCP client
         parsed_dimensions = dimensions
         if isinstance(dimensions, str):
@@ -649,7 +892,7 @@ def get_ga4_data(
         dimension_objects = [Dimension(name=d) for d in parsed_dimensions]
         metric_objects = [Metric(name=m) for m in parsed_metrics]
         request = RunReportRequest(
-            property=f"properties/{config.property_id}",
+            property=f"properties/{property_id}",  # Use the provided property_id parameter
             dimensions=dimension_objects,
             metrics=metric_objects,
             date_ranges=[DateRange(start_date=date_range_start, end_date=date_range_end)],
@@ -674,15 +917,23 @@ def get_ga4_data(
     except Exception as e:
         error_message = f"Error fetching GA4 data: {str(e)}"
         print(error_message, file=sys.stderr)
+        
+        # Check for specific error patterns to provide more helpful messages
+        error_str = str(e).lower()
+        if "property not found" in error_str or "invalid resource name" in error_str:
+            if property_id is None:
+                error_message = "property_id parameter is required. Use list_ga4_properties to get available property IDs."
+            else:
+                error_message = f"Property ID '{property_id}' not found or not accessible. Use list_ga4_properties to get available property IDs."
+        
         if hasattr(e, 'details'):
             error_message += f" Details: {e.details()}"
+            
         return {"error": error_message}
 
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Google Analytics 4 MCP Server with OAuth2 and SSE support')
-    parser.add_argument('--property-id', 
-                       help='GA4 Property ID (can also be set via GA4_PROPERTY_ID env var)')
     parser.add_argument('--token-path', default='token.pickle',
                        help='Path to store OAuth2 token (default: token.pickle)')
     parser.add_argument('--port', type=int, default=8000,
@@ -701,15 +952,7 @@ def parse_args():
 
 def validate_configuration():
     """Validate that all required configuration is present."""
-    # Check for property ID
-    if not config.property_id:
-        config.property_id = os.getenv('GA4_PROPERTY_ID')
-    
-    if not config.property_id:
-        print("ERROR: GA4 Property ID not specified", file=sys.stderr)
-        print("Please provide it via --property-id or set GA4_PROPERTY_ID environment variable", file=sys.stderr)
-        return False
-    
+
     # Check for OAuth credentials
     if not config.client_id:
         config.client_id = os.getenv('GOOGLE_OAUTH_CLIENT_ID')
@@ -724,7 +967,6 @@ def main():
     args = parse_args()
     
     # Configure from args and environment
-    config.property_id = args.property_id
     config.token_path = args.token_path
     config.port = args.port
     config.host = args.host
@@ -749,8 +991,8 @@ def main():
         return
     
     print(f"Starting GA4 MCP server on {config.host}:{config.port}...", file=sys.stderr)
-    print(f"Using GA4 Property ID: {config.property_id}", file=sys.stderr)
     print(f"Transport mode: {args.transport}", file=sys.stderr)
+    print("Property management enabled: Use list_ga4_properties tool to view available properties", file=sys.stderr)
     
     try:
         # Test OAuth credentials on startup
